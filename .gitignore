@@ -1,0 +1,72 @@
+# Python缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 环境文件
+.env
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Python包
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+*.log
+*.pot
+coverage.* 
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+*.mo
+*.pyo
+*.~ 
+*.mypy_cache/
+*.dmypy.json
+.pyre/
+
+# 配置文件
+*.cfg
+*.ini
+*.toml
+
+# 编辑器/IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# 数据库
+*.sqlite3
+
+# PyInstaller
+# 由于不同的平台构建的文件不同，具体的忽略可以根据构建的文件自行调整
+*.spec
+
+# 单元测试
+.pytest_cache/
+
+# MyPy
+.mypy_cache/
+
+# 自定义忽略
+.env.testing
+.env.release

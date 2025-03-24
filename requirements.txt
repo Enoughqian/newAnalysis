@@ -1,0 +1,7 @@
+openai
+flask
+apscheduler[psycopg,sqlalchemy]
+numpy
+mysql-connector-python
+faiss-cpu
+gunicorn
