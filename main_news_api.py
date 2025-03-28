@@ -13,8 +13,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from openai import OpenAI
 from collections import defaultdict, Counter
 
-from utils.parse import parse_json
-from utils.prompt_templates import classify_prompt, content_prompt
+from utils.parse import parse_json, count_words, calculate_abstract_length
+from utils.prompt_templates import classify_prompt, base_content_prompt, short_content_prompt, country_normalization_map
 from utils.database import VectorSearch
 from config import LLM_CONFIG, NEWS_API_CONFIG, VECTOR_SEARCH_CONFIG, DOUBAO_CONFIG, EMBEDDING_CONFIG
 
@@ -129,7 +129,7 @@ def _call_doubao_api_stream(
     # 初始化客户端
     client = OpenAI(api_key=api_key, base_url=base_url)
     try:
-        ans_str = ""
+        ans_str, response = "", "未推理成功"
         response = client.chat.completions.create(
             model = model_name,
             messages=[
@@ -154,7 +154,7 @@ def _call_doubao_api_stream(
             usage_dict = response.usage.to_dict()
         return ans_str, usage_dict
     except Exception as e:
-        logger.error(f"OpenAI API调用失败: {str(e)}")
+        logger.error(f"OpenAI API调用失败: {str(e)} - {response}")
         traceback.print_exc()
         return "", {}
 
@@ -166,7 +166,7 @@ def _call_embedding_api_doubao(
     """豆包的embedding API调用方法"""
     try:
         client = OpenAI(api_key=EMB_KEY, base_url=EMB_URL)
-
+        resp = "未推理成功"
         resp = client.embeddings.create(
             model=EMB_MODEL_NAME,
             input=[text],
@@ -178,14 +178,15 @@ def _call_embedding_api_doubao(
         return True, ans, cost
     except Exception as e:
         traceback.print_exc()
-        logger.error(f"Embedding API调用失败: {str(e)}")
+        logger.error(f"Embedding API调用失败: {str(e)} - {resp}")
         return False, e, 0
 
 
 class NewsAnalyzer:
     def __init__(self):
         self.classify_prompt = classify_prompt
-        self.content_prompt = content_prompt
+        self.base_content_prompt = base_content_prompt
+        self.short_content_prompt = short_content_prompt
 
         self.model_costs = LLM_CONFIG['COSTS']
         self.embedding_id_dict = {}
@@ -215,7 +216,7 @@ class NewsAnalyzer:
             prompt = self.classify_prompt + str(prompt_title_list)
             llm_response, usage = _call_doubao_api_stream(
                 prompt, 
-                "你是一个新闻分类专家", 
+                "你是新闻分类与判断专家", 
                 model_name=BASE_MODEL_NAME)
             if len(llm_response) == 0:
                 logger.warning("语言模型请求失败")
@@ -344,10 +345,23 @@ class NewsAnalyzer:
                 logger.warning(f"内容为空 ID:{content_id}")
                 return result_template
 
-            logger.info(f"开始处理内容 ID:{content_id}")
+            content_len = count_words(content_dict['content'])
+            if content_len < 250:
+                logger.info(f"开始处理内容 ID:{content_id}，原文长度:{content_len}")
+                used_prompt = self.short_content_prompt
+            else:
+                min_abstract_len = calculate_abstract_length(content_len)
+                max_abstract_len = min(min_abstract_len * 2, 500)
+                logger.info(f"开始处理内容 ID:{content_id}，原文长度:{content_len}, 预期摘要长度:{min_abstract_len}-{max_abstract_len}")
+                used_prompt = self.base_content_prompt.format(
+                    min_abstract_len=min_abstract_len,
+                    max_abstract_len=max_abstract_len
+                )
+
+            print(used_prompt)
             llm_response, usage = _call_doubao_api_stream(
-                self.content_prompt + str(content_dict['content']),
-                "你是一个新闻阅读与结构化整理专家", 
+                used_prompt + str(content_dict['content']),
+                "你是新闻阅读与结构化整理专家", 
                 model_name=DOUBAO_MODEL_NAME
             )
             if len(llm_response) == 0:
@@ -387,11 +401,21 @@ class NewsAnalyzer:
 
             # 记录翻译长度
             translation = content_ans_dict.get('translate', '')
+            if len(translation) == 0:
+                logger.warning(f"翻译为空 ID:{content_id}, {content_ans_dict}")
             result_template['translation_len'] = len(translation)
 
-            # 记录
-            abstract = content_ans_dict.get('abstract', '')
+            # 记录摘要长度
+            abstract = content_ans_dict.get('abstract', translation)
             result_template['abstract_len'] = len(abstract)
+
+            # 国家二次纠正
+            country_list = content_ans_dict.get('country', [])
+            norm_country_list = []
+            for country in country_list:
+                country = country.strip().split('(')[0].split('（')[0]
+                country = country_normalization_map.get(country, country)
+                norm_country_list.append(country)
 
             # 回调任务处理
             tasks = [
@@ -399,8 +423,8 @@ class NewsAnalyzer:
                 ("genAbstract", abstract),
                 # ("genClassify", content_ans_dict.get('theme', []) + 
                 #                 [f'公司-{tmp}' for tmp in content_ans_dict.get('company', '')] ),
-                ("genKeyword", content_ans_dict.get('keywords', [])),
-                ("recCountry", content_ans_dict.get('country', [])),
+                ("genKeyword", content_ans_dict.get('keywords', []) ),
+                ("recCountry", norm_country_list ),
             ]
 
             # 判断是否回调embedding
@@ -434,7 +458,7 @@ class NewsAnalyzer:
 
             logger.info(
                 f"内容处理成功 ID:{content_id} | 成本:{cost:.04f} | "
-                f"原始长度:{len(content_dict['content'])} | "
+                f"原始长度:{content_len} | "
                 f"翻译长度:{len(content_ans_dict.get('translate',''))} | "
                 f"摘要长度:{len(content_ans_dict.get('abstract',''))}"
             )
