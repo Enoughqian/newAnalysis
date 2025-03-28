@@ -51,8 +51,9 @@ base_content_prompt = """请根据规则分析下面新闻内容，获取摘要�
 * 应该严格逐句翻译全文，减少对原文进行优化或缩写
 
 ## 缩写要求
-* 新闻摘要内容应该在{min_abstract_len}-{max_abstract_len}字之间
-* 摘要大于200字时，可以根据实际文章内容划分2-3个自然段，用`\\n`切分
+* 请从专业记者角度，撰写结构完整、逻辑连贯的新闻摘要内容，而非条列式分点总结。
+* 字数在{min_abstract_len}-{max_abstract_len}字之间
+* 字数过多时，可根据人类阅读习惯，将内容划分2-3个自然段，用`\\n`切分
 * 要求明确发生时间日期、地点、人物等关键信息，避免在摘要中丢失关键信息
 
 ## 关键词
@@ -70,7 +71,7 @@ base_content_prompt = """请根据规则分析下面新闻内容，获取摘要�
 ```
 {{
   "translate": "",
-  "abstract": "",  # 中文在{min_abstract_len}-{max_abstract_len}之间
+  "abstract": "",  # 连贯的不分点中文，在{min_abstract_len}-{max_abstract_len}之间，字数过多时可分成自然段
   "keywords": [],  # 3-6个新闻的中文关键词，越精简越好
   "country": [], # 中文国家或地区名
 }}```
