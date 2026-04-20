@@ -2,32 +2,28 @@ import os
 
 # LLM配置
 LLM_CONFIG = {
-    # 'API_KEY': 'sk-V8RTUXs5GF4dQ5o4B0618fA095F9425986732423563115E',
-    'API_KEY': '90f66b8f-7fa8-4276-a362-8d26055d1c32',
-    # 'BASE_URL': 'https://api.bltcy.ai/v1',
+    'API_KEY': '82455d5f-5d05-4fa3-988d-f5b4c9d173d9',
     "BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
-    'MODEL_NAME': 'deepseek-v3-250324',  # 以下不再可选: gpt-4o-2024-08-06, gpt-4o-2024-11-20
+    'MODEL_NAME': 'doubao-seed-2-0-pro-260215',
+    'REASONING_EFFORT': 'medium',
     'COSTS': {
-        "gpt-4o-2024-11-20": {"prompt": 0.00625 / 1000, "completion": 0.025 / 1000},
-        "gpt-4o-2024-08-06": {"prompt": 0.00625 / 1000, "completion": 0.025 / 1000},
-        "deepseek-v3-250324": {"prompt": 0.002 / 1000, "completion": 0.008 / 1000},
-        "doubao-1-5-pro-32k-250115": {"prompt": 0.0008 / 1000, "completion": 0.002 / 1000},
-        "BAAI/bge-large-en-v1.5": {"prompt": 0.0002},
+        "doubao-seed-2-0-pro-260215": {"prompt": 0.0032 / 1000, "completion": 0.016 / 1000},
+        "doubao-seed-2-0-lite-260215": {"prompt": 0.0006 / 1000, "completion": 0.0036 / 1000},
         "doubao-embedding-large-text-240915": {"prompt": 0.0007},
-        "doubao-embedding-text-240715": {"prompt": 0.0005}
     }
 }
 
-# DOUBAO LLM配置
+# DOUBAO LLM配置（翻译与摘要）
 DOUBAO_CONFIG = {
-    'API_KEY': '90f66b8f-7fa8-4276-a362-8d26055d1c32',
+    'API_KEY': '82455d5f-5d05-4fa3-988d-f5b4c9d173d9',
     'BASE_URL': 'https://ark.cn-beijing.volces.com/api/v3',
-    'MODEL_NAME': "doubao-1-5-pro-32k-250115",  # 可选: doubao-1-5-pro-32k-250115, deepseek-r1-250120, deepseek-v3-250324
+    'MODEL_NAME': "doubao-seed-2-0-lite-260215",
+    'REASONING_EFFORT': 'low',
 }
 
 # Embedding配置
 EMBEDDING_CONFIG = {
-    'API_KEY': '90f66b8f-7fa8-4276-a362-8d26055d1c32',
+    'API_KEY': '82455d5f-5d05-4fa3-988d-f5b4c9d173d9',
     'BASE_URL': 'https://ark.cn-beijing.volces.com/api/v3',
     'MODEL_NAME': "doubao-embedding-large-text-240915", 
 }

@@ -45,6 +45,7 @@ logger.addHandler(console_handler)
 OPENAI_KEY = LLM_CONFIG['API_KEY']
 OPENAI_BASE_URL = LLM_CONFIG['BASE_URL']
 BASE_MODEL_NAME = LLM_CONFIG['MODEL_NAME']
+BASE_REASONING_EFFORT = LLM_CONFIG['REASONING_EFFORT']
 
 EMB_MODEL_NAME = EMBEDDING_CONFIG['MODEL_NAME']
 EMB_URL = EMBEDDING_CONFIG['BASE_URL']
@@ -53,6 +54,7 @@ EMB_KEY = EMBEDDING_CONFIG['API_KEY']
 DOUBAO_KEY = DOUBAO_CONFIG['API_KEY']
 DOUBAO_URL = DOUBAO_CONFIG['BASE_URL']
 DOUBAO_MODEL_NAME = DOUBAO_CONFIG['MODEL_NAME']
+DOUBAO_REASONING_EFFORT = DOUBAO_CONFIG['REASONING_EFFORT']
 
 NEWS_API_BASE_URL = NEWS_API_CONFIG['BASE_URL']
 
@@ -92,13 +94,13 @@ def refresh_faiss_matrix():
 
 
 def _call_openai_api(
-    prompt, system_role, 
-    api_key=OPENAI_KEY, 
+    prompt, system_role,
+    api_key=OPENAI_KEY,
     base_url=OPENAI_BASE_URL,
-    model_name=BASE_MODEL_NAME
+    model_name=BASE_MODEL_NAME,
+    reasoning_effort=BASE_REASONING_EFFORT
 ):
     """统一的OpenAI API调用方法"""
-    # 初始化客户端
     client = OpenAI(api_key=api_key, base_url=base_url)
     try:
         response = "未推理成功"
@@ -109,8 +111,8 @@ def _call_openai_api(
                 {"role": "user", "content": prompt},
             ],
             response_format={'type': 'json_object'},
-            temperature=0,
-            stream=False
+            stream=False,
+            extra_body={"reasoning_effort": reasoning_effort}
         )
         return response
     except Exception as e:
@@ -119,26 +121,26 @@ def _call_openai_api(
         return None
     
 def _call_doubao_api_stream(
-    prompt, system_role, 
+    prompt, system_role,
     api_key=DOUBAO_KEY,
     base_url=DOUBAO_URL,
     model_name=DOUBAO_MODEL_NAME,
+    reasoning_effort=DOUBAO_REASONING_EFFORT,
     stream_flag=False
 ):
     """统一的OpenAI API调用方法，返回流式响应"""
-    # 初始化客户端
     client = OpenAI(api_key=api_key, base_url=base_url)
     try:
         ans_str, response = "", "未推理成功"
         response = client.chat.completions.create(
-            model = model_name,
+            model=model_name,
             messages=[
                 {"role": "system", "content": system_role},
                 {"role": "user", "content": prompt},
             ],
             response_format={'type': 'json_object'},
-            temperature=0.01,
-            stream=stream_flag
+            stream=stream_flag,
+            extra_body={"reasoning_effort": reasoning_effort}
         )
         if stream_flag:
             # 逐步接收数据
@@ -215,9 +217,10 @@ class NewsAnalyzer:
 
             prompt = self.classify_prompt + str(prompt_title_list)
             llm_response, usage = _call_doubao_api_stream(
-                prompt, 
-                "你是新闻分类与判断专家", 
-                model_name=BASE_MODEL_NAME)
+                prompt,
+                "你是新闻分类与判断专家",
+                model_name=BASE_MODEL_NAME,
+                reasoning_effort=BASE_REASONING_EFFORT)
             if len(llm_response) == 0:
                 logger.warning("语言模型请求失败")
                 return False,0
@@ -327,8 +330,7 @@ class NewsAnalyzer:
             'cost': 0.0,
             'prompt_tokens': 0,
             'completion_tokens': 0,
-            'translation_len': 0,
-            'abstract_len': 0, 
+            'abstract_len': 0,
             'original_len': len(content_dict.get('content', '')),
             'errors': [],
             'failed_callbacks': []
@@ -358,7 +360,6 @@ class NewsAnalyzer:
                     max_abstract_len=max_abstract_len
                 )
 
-            print(used_prompt)
             llm_response, usage = _call_doubao_api_stream(
                 used_prompt + str(content_dict['content']),
                 "你是新闻阅读与结构化整理专家", 
@@ -399,14 +400,10 @@ class NewsAnalyzer:
                 logger.error(f"JSON解析失败 ID:{content_id}")
                 return result_template
 
-            # 记录翻译长度
-            translation = content_ans_dict.get('translate', '')
-            if len(translation) == 0:
-                logger.warning(f"翻译为空 ID:{content_id}, {content_ans_dict}")
-            result_template['translation_len'] = len(translation)
-
-            # 记录摘要长度
-            abstract = content_ans_dict.get('abstract', translation)
+            # 记录摘要长度，将title拼接到abstract前面
+            title = content_ans_dict.get('title', '')
+            abstract_body = content_ans_dict.get('abstract', '')
+            abstract = f"{title}\n{abstract_body}" if title else abstract_body
             result_template['abstract_len'] = len(abstract)
 
             # 国家二次纠正
@@ -419,12 +416,9 @@ class NewsAnalyzer:
 
             # 回调任务处理
             tasks = [
-                ("genTranslate", translation),
                 ("genAbstract", abstract),
-                # ("genClassify", content_ans_dict.get('theme', []) + 
-                #                 [f'公司-{tmp}' for tmp in content_ans_dict.get('company', '')] ),
-                ("genKeyword", content_ans_dict.get('keywords', []) ),
-                ("recCountry", norm_country_list ),
+                ("genKeyword", content_ans_dict.get('keywords', [])),
+                ("recCountry", norm_country_list),
             ]
 
             # 判断是否回调embedding
@@ -459,8 +453,7 @@ class NewsAnalyzer:
             logger.info(
                 f"内容处理成功 ID:{content_id} | 成本:{cost:.04f} | "
                 f"原始长度:{content_len} | "
-                f"翻译长度:{len(content_ans_dict.get('translate',''))} | "
-                f"摘要长度:{len(content_ans_dict.get('abstract',''))}"
+                f"摘要长度:{len(abstract)}"
             )
             return result_template
 

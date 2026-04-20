@@ -1,7 +1,8 @@
-openai
+'openai>=1.66.2'
 flask
 apscheduler[psycopg,sqlalchemy]
 numpy
 mysql-connector-python
 faiss-cpu
 gunicorn
+scikit-learn
