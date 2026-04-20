@@ -30,13 +30,13 @@ EMBEDDING_CONFIG = {
 
 # 新闻服务API配置
 NEWS_API_CONFIG = {
-    'BASE_URL': 'http://152.32.218.226:9999/news_server/api',
-    'RECALL_URL': 'http://152.32.218.226:9999/news_server/api/recallTask'
+    'BASE_URL': 'http://10.3.8.16:9999/news_server/api',
+    'RECALL_URL': 'http://10.3.8.16:9999/news_server/api/recallTask'
 }
 
 # 数据库配置
 DB_CONFIG = {
-    'host': '152.32.218.226',
+    'host': '43.160.200.78',
     'user': 'work',
     'password': 'Sqe3u8N_VP',
     'database': 'spider_news'
