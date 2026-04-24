@@ -110,7 +110,6 @@ def _call_openai_api(
                 {"role": "system", "content": system_role},
                 {"role": "user", "content": prompt},
             ],
-            response_format={'type': 'json_object'},
             stream=False,
             extra_body={"reasoning_effort": reasoning_effort}
         )
@@ -138,7 +137,6 @@ def _call_doubao_api_stream(
                 {"role": "system", "content": system_role},
                 {"role": "user", "content": prompt},
             ],
-            response_format={'type': 'json_object'},
             stream=stream_flag,
             extra_body={"reasoning_effort": reasoning_effort}
         )
@@ -353,7 +351,7 @@ class NewsAnalyzer:
                 used_prompt = self.short_content_prompt
             else:
                 min_abstract_len = calculate_abstract_length(content_len)
-                max_abstract_len = min(min_abstract_len * 2, 500)
+                max_abstract_len = min(min_abstract_len * 2, 300)
                 logger.info(f"开始处理内容 ID:{content_id}，原文长度:{content_len}, 预期摘要长度:{min_abstract_len}-{max_abstract_len}")
                 used_prompt = self.base_content_prompt.format(
                     min_abstract_len=min_abstract_len,
