@@ -1,8 +1,8 @@
-'openai>=1.66.2'
-flask
-apscheduler[psycopg,sqlalchemy]
-numpy
-mysql-connector-python
-faiss-cpu
-gunicorn
-scikit-learn
+openai>=1.66.2,<3
+Flask>=3.0,<4
+APScheduler>=3.10,<4
+numpy>=1.26,<3
+mysql-connector-python>=9.2,<10
+faiss-cpu>=1.8,<2
+gunicorn>=23,<24
+requests>=2.32,<3

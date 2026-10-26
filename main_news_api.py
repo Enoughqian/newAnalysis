@@ -1,609 +1,324 @@
-import os
+"""News classification and summarization service; importing this module performs no I/O."""
 import logging
-import time, json
+import os
 import threading
-import requests
-import traceback
-import concurrent.futures
-import numpy as np
-from add_embedding_time import add_missing_embeddings
+import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 
-from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
-from openai import OpenAI
-from collections import defaultdict, Counter
+from flask import Flask, jsonify
 
+from config import LLM_CONFIG, DOUBAO_CONFIG, EMBEDDING_CONFIG, VECTOR_SEARCH_CONFIG, RUNTIME_CONFIG
+from utils.pending_vectors import PendingVectors
+from utils.database import VectorSearch
+from utils.model_api import chat, embedding, estimate_cost, validate_model_config
+from utils.news_api import fetch_tasks, callback
 from utils.parse import parse_json, count_words, calculate_abstract_length
 from utils.prompt_templates import classify_prompt, base_content_prompt, short_content_prompt, country_normalization_map
-from utils.database import VectorSearch
-from config import LLM_CONFIG, NEWS_API_CONFIG, VECTOR_SEARCH_CONFIG, DOUBAO_CONFIG, EMBEDDING_CONFIG
 
-# 初始化配置
-app = Flask(__name__)
-scheduler = BackgroundScheduler(daemon=True)
-
-# 日志配置
-# 配置日志同时输出到文件和控制台
-formatter = logging.Formatter('[%(levelname)s-%(asctime)s] %(message)s')
-
-# 创建文件处理器
-file_handler = logging.FileHandler('news_analysis.log', encoding='utf-8')
-file_handler.setFormatter(formatter)
-
-# 创建控制台处理器
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(formatter)
-
-# 获取根日志记录器并配置
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
+app = Flask(__name__)
+scheduler = BackgroundScheduler(daemon=True, timezone='Asia/Shanghai')
+# All manual triggers, scheduled runs and index refreshes share one process-wide lock.
+processing_lock = threading.Lock()
+ready = False
+last_pipeline = None
+faiss_matrix = VectorSearch(VECTOR_SEARCH_CONFIG['DIMENSION'], logger)
+pending_vectors = PendingVectors()
 
 
-# 环境配置
-OPENAI_KEY = LLM_CONFIG['API_KEY']
-OPENAI_BASE_URL = LLM_CONFIG['BASE_URL']
-BASE_MODEL_NAME = LLM_CONFIG['MODEL_NAME']
-BASE_REASONING_EFFORT = LLM_CONFIG['REASONING_EFFORT']
-
-EMB_MODEL_NAME = EMBEDDING_CONFIG['MODEL_NAME']
-EMB_URL = EMBEDDING_CONFIG['BASE_URL']
-EMB_KEY = EMBEDDING_CONFIG['API_KEY']
-
-DOUBAO_KEY = DOUBAO_CONFIG['API_KEY']
-DOUBAO_URL = DOUBAO_CONFIG['BASE_URL']
-DOUBAO_MODEL_NAME = DOUBAO_CONFIG['MODEL_NAME']
-DOUBAO_REASONING_EFFORT = DOUBAO_CONFIG['REASONING_EFFORT']
-
-NEWS_API_BASE_URL = NEWS_API_CONFIG['BASE_URL']
-
-THRESHOLD = VECTOR_SEARCH_CONFIG['THRESHOLD']
-DIMENSION = VECTOR_SEARCH_CONFIG['DIMENSION']
-true = True
-false = False
-
-# 初始化
-faiss_matrix = VectorSearch(dim = DIMENSION, logger=logger)
-LOAD_HOURS = VECTOR_SEARCH_CONFIG['LOAD_HOURS']
-faiss_matrix.import_from_mysql(hours_limit=LOAD_HOURS)   # 修改导入函数，只导入最近小时的数据
-logger.info(f"从数据库导入Embedding数量(最近{LOAD_HOURS}小时): {faiss_matrix.display_embedding_nums()}")
-
-# 添加定时刷新任务
-@scheduler.scheduled_job('interval', hours=1)
-def refresh_faiss_matrix():
-    """每小时刷新一次 faiss_matrix 并补充缺失的embedding"""
-    try:
-        # 补充缺失的embedding
-        logger.info("开始补充缺失的embedding")
-        result = add_missing_embeddings()
-        if result:
-            logger.info(f"补充embedding完成！成功: {result['success']}, 失败: {result['fail']}, 总数: {result['total']}")
-        
-        # 刷新faiss_matrix
-        logger.info("开始刷新 faiss_matrix")
-        global faiss_matrix
-        new_matrix = VectorSearch(dim=DIMENSION, logger=logger)
-        new_matrix.import_from_mysql(hours_limit=LOAD_HOURS)
-        faiss_matrix = new_matrix
-        logger.info(f"faiss_matrix 刷新完成，当前 Embedding 数量: {faiss_matrix.display_embedding_nums()}")
-    except Exception as e:
-        traceback.print_exc()
-        logger.error(f"faiss_matrix 刷新失败: {str(e)}")
-        traceback.print_exc()
+def validate_classification(text, count):
+    ok, result = parse_json(text)
+    if not ok or not isinstance(result, dict):
+        raise ValueError('分类结果不是合法 JSON 对象')
+    result = {str(k): v for k, v in result.items()}
+    if set(result) != {str(i) for i in range(1, count + 1)}:
+        raise ValueError('分类结果序号缺失或越界')
+    for item in result.values():
+        if not isinstance(item, dict) or type(item.get('flag')) is not bool:
+            raise ValueError('分类 flag 必须是 JSON 布尔值')
+        if item['flag'] and item.get('theme') not in {'政治', '军事', '社会', '经济'}:
+            raise ValueError('分类 theme 必须是四种主题之一')
+    return result
 
 
-def _call_openai_api(
-    prompt, system_role,
-    api_key=OPENAI_KEY,
-    base_url=OPENAI_BASE_URL,
-    model_name=BASE_MODEL_NAME,
-    reasoning_effort=BASE_REASONING_EFFORT
-):
-    """统一的OpenAI API调用方法"""
-    client = OpenAI(api_key=api_key, base_url=base_url)
-    try:
-        response = "未推理成功"
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": system_role},
-                {"role": "user", "content": prompt},
-            ],
-            stream=False,
-            extra_body={"reasoning_effort": reasoning_effort}
-        )
-        return response
-    except Exception as e:
-        traceback.print_exc()
-        logger.error(f"OpenAI API调用失败: {str(e)}, {response}")
-        return None
-    
-def _call_doubao_api_stream(
-    prompt, system_role,
-    api_key=DOUBAO_KEY,
-    base_url=DOUBAO_URL,
-    model_name=DOUBAO_MODEL_NAME,
-    reasoning_effort=DOUBAO_REASONING_EFFORT,
-    stream_flag=False
-):
-    """统一的OpenAI API调用方法，返回流式响应"""
-    client = OpenAI(api_key=api_key, base_url=base_url)
-    try:
-        ans_str, response = "", "未推理成功"
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": system_role},
-                {"role": "user", "content": prompt},
-            ],
-            stream=stream_flag,
-            extra_body={"reasoning_effort": reasoning_effort}
-        )
-        if stream_flag:
-            # 逐步接收数据
-            usage_dict = {}
-            for chunk in response:
-                if chunk.choices[0].delta.content:
-                    ans_str += chunk.choices[0].delta.content
-                elif chunk.usage:   # 目前云无法返回这部分数据
-                    usage_dict = chunk.usage.to_dict()
-        else:
-            # 一次性接收数据
-            ans_str = response.choices[0].message.content
-            usage_dict = response.usage.to_dict()
-        return ans_str, usage_dict
-    except Exception as e:
-        logger.error(f"OpenAI API调用失败: {str(e)} - {response}")
-        traceback.print_exc()
-        return "", {}
-
-def _call_embedding_api_doubao(
-    text,
-    api_key=EMB_KEY, base_url=EMB_URL,
-    model=EMB_MODEL_NAME
-):
-    """豆包的embedding API调用方法"""
-    try:
-        client = OpenAI(api_key=EMB_KEY, base_url=EMB_URL)
-        resp = "未推理成功"
-        resp = client.embeddings.create(
-            model=EMB_MODEL_NAME,
-            input=[text],
-            encoding_format="float"
-        )
-        vector = resp.data[0].embedding
-        cost = resp.usage.to_dict()
-        ans = np.array(vector).astype('float64').tolist()
-        return True, ans, cost
-    except Exception as e:
-        traceback.print_exc()
-        logger.error(f"Embedding API调用失败: {str(e)} - {resp}")
-        return False, e, 0
+def validate_summary(text, max_abstract_len=300):
+    ok, result = parse_json(text)
+    if not ok or not isinstance(result, dict):
+        raise ValueError('摘要结果不是合法 JSON 对象')
+    for field in ('title', 'abstract'):
+        if not isinstance(result.get(field), str) or not result[field].strip():
+            raise ValueError('摘要缺少 ' + field)
+    for field in ('keywords', 'country'):
+        if not isinstance(result.get(field), list) or any(not isinstance(x, str) for x in result[field]):
+            raise ValueError(field + ' 必须是字符串数组')
+    return result
 
 
 class NewsAnalyzer:
-    def __init__(self):
-        self.classify_prompt = classify_prompt
-        self.base_content_prompt = base_content_prompt
-        self.short_content_prompt = short_content_prompt
-
-        self.model_costs = LLM_CONFIG['COSTS']
-        self.embedding_id_dict = {}
-        self.lock = threading.Lock()
-
     def analyze_news_list(self):
-        """新闻列表分析核心逻辑"""
+        global faiss_matrix
+        cost = 0.0
         try:
-            logger.info("开始执行新闻列表分析任务")
-            response = requests.get(f"{NEWS_API_BASE_URL}/getTask?taskname=recTitle&num=20&limit_time=10")
-            
-            if response.status_code != 200 or response.json().get('msg') != '获取完成':
-                title_data = response.json()
-                msg = f"获取新闻列表失败 - {title_data}"
-                logger.error(msg)
-                return False, 0
-            
-            title_data = response.json()['data']
-            if not title_data:
-                logger.warning("获取新闻列表为空")
-                return False, 0 
-            
-            prompt_id_list = [item['id'] for item in title_data]
-            prompt_title_list = [item['title'] for item in title_data]
-            logger.info(f"[标题分析] 总计获取标题：{len(prompt_title_list)}")
-
-            prompt = self.classify_prompt + str(prompt_title_list)
-            llm_response, usage = _call_doubao_api_stream(
-                prompt,
-                "你是新闻分类与判断专家",
-                model_name=BASE_MODEL_NAME,
-                reasoning_effort=BASE_REASONING_EFFORT)
-            if len(llm_response) == 0:
-                logger.warning("语言模型请求失败")
-                return False,0
-
-            # 记录使用量与成本
-            model_cost = self.model_costs[BASE_MODEL_NAME]
-            cost = (
-                usage.get('prompt_tokens', 0) * model_cost['prompt'] +
-                usage.get('completion_tokens', 0) * model_cost['completion'] +
-                usage.get('prompt_cache_hit_tokens', 0) * model_cost.get('cache_prompt', 0)
-            )
-
-            flag, use_dict = parse_json(llm_response)
-            if not flag:
-                logger.error("分类结果解析失败")
-                return False
-
-            news_data = []
-            for idx_str, ans_dict in use_dict.items():
-                try:
-                    idx = int(float(idx_str)) - 1
-                    news_id = prompt_id_list[idx]
-                    flag_value = ans_dict.get('flag', False)
-                    news_classify = ans_dict.get('theme', [])
-                    is_relevant = flag_value in (True, 'true', 'True')
-                    if is_relevant:
-                        emb_flag, embedding, emb_usage = _call_embedding_api_doubao(prompt_title_list[idx])
-                        if emb_flag:
-                            emb_usage = self.model_costs[EMB_MODEL_NAME]
-                            emb_cost = emb_usage.get('prompt_tokens', 0) * model_cost['prompt']
-                            add_flag = faiss_matrix.add_vector(embedding, thre=THRESHOLD)  # 相似度阈值，可以根据实际情况调整
-                            tag = 1 if add_flag else -1
-                            if add_flag:
-                                self.embedding_id_dict[news_id] = embedding
-                        else:
-                            logging.warning(f"[analysis embedding error] {emb_flag} - {embedding}存在问题")
-                            tag, emb_cost = 1, 0
-                        # emb_flag, embedding = False, '未使用embedding'
-                        # tag, emb_cost = 1, 0
-                    else:
-                        tag, emb_cost = 0, 0
-
-                    news_single_dict = { 'id': news_id, 'tag': tag, 'cost': round(cost/len(use_dict) + emb_cost, 8) }
-                    if tag:
-                        if isinstance(news_classify, list):
-                            news_single_dict['classify'] = news_classify[:1]
-                        elif isinstance(news_classify, str):
-                            news_single_dict['classify'] = [news_classify]
-                        else:
-                            news_single_dict['classify'] = []
-                    news_data.append(news_single_dict)
-
-                except Exception as e:
-                    traceback.print_exc()
-                    logger.warning(f"索引解析异常: {idx_str} - {str(e)}")
-
-            recall_response = requests.post(
-                f"{NEWS_API_BASE_URL}/recallTask",
-                json={"taskname": "recTitle", "data": news_data}
-            )
-            logger.info(f"新闻列表分析完成，成功更新{recall_response.json().get('success_num', 0)}条 | 详情: {news_data} | 成本: {cost:.04f}")
-            return True, cost
-            
-        except Exception as e:
-            logger.error(f"新闻列表分析异常: {str(e)}\n{traceback.format_exc()}")
-            traceback.print_exc()
-            return False, 0
+            rows = fetch_tasks('recTitle', RUNTIME_CONFIG['TITLE_BATCH_SIZE'])
+            if not rows:
+                return {'status': 'success', 'message': '无待分类新闻', 'processed_count': 0, 'cost': 0.0}
+            if any(not isinstance(row.get('title'), str) or not row['title'].strip() for row in rows):
+                raise ValueError('待分类新闻标题为空')
+            import json
+            text, usage = chat(classify_prompt + json.dumps([r['title'] for r in rows], ensure_ascii=False),
+                               '你是新闻分类与判断专家', LLM_CONFIG)
+            cost = estimate_cost(LLM_CONFIG['MODEL_NAME'], usage)
+            classifications = validate_classification(text, len(rows))
+            staged = faiss_matrix.clone()
+            results, vectors = [], []
+            classify_cost = cost / len(rows)
+            for i, row in enumerate(rows, 1):
+                answer = classifications[str(i)]
+                vector_cost = 0.0
+                tag = 0
+                if answer['flag']:
+                    vector, vector_usage = embedding(row['title'])
+                    vector_cost = estimate_cost(EMBEDDING_CONFIG['MODEL_NAME'], vector_usage)
+                    cost += vector_cost
+                    tag = 1 if staged.add_vector(vector, news_id=row['id']) else -1
+                    if tag == 1:
+                        vectors.append({'id': row['id'], 'result': vector, 'cost': round(vector_cost, 8)})
+                item = {'id': row['id'], 'tag': tag, 'cost': round(classify_cost + vector_cost, 8)}
+                if tag:
+                    item['classify'] = [answer['theme']]
+                results.append(item)
+            # The online crawler creates news_detail only after recTitle is accepted.
+            # Persist a model-scoped hand-off locally; do not send genVec to a missing row.
+            pending_vectors.save(vectors)
+            callback('recTitle', results)
+            pending_vectors.confirm([row['id'] for row in vectors])
+            faiss_matrix = staged
+            return {'status': 'success', 'message': '新闻分类已完成', 'processed_count': len(results),
+                    'cost': round(cost, 8), 'detailed_results': results}
+        except Exception as exc:
+            logger.exception('新闻分类失败')
+            return {'status': 'error', 'message': str(exc), 'processed_count': 0, 'cost': round(cost, 8)}
 
     def _get_content_list(self):
-        """获取待处理内容列表（含重试机制）"""
-        retry_count = 0
-        while retry_count < 3:
-            try:
-                response = requests.get(
-                    f"{NEWS_API_BASE_URL}/getTask",
-                    params={
-                        # "taskname": "genTranslate",
-                        "taskname": "recCountry",
-                        "num": 10,
-                        "limit_time": 10
-                    }
-                )
-                
-                if response.json().get('num', 0) > 0:
-                    return response.json()['data']
-                
-                if response.json().get('msg') == '当前已取净':
-                    logger.info("内容列表已取净，等待重试...")
-                    time.sleep(60)
-                    retry_count += 1
-                else:
-                    return []
-                    
-            except Exception as e:
-                logger.error(f"获取内容列表失败: {str(e)}")
-                retry_count += 1
-                time.sleep(30)
-        
-        return []
+        return fetch_tasks('recCountry', RUNTIME_CONFIG['CONTENT_BATCH_SIZE'])
 
-    def process_single_content(self, content_dict):
-        """处理单个新闻内容，返回包含详细信息的字典"""
-        content_id = content_dict.get('id', 'unknown')
-        result_template = {
-            'id': content_id,
-            'status': 'success',
-            'cost': 0.0,
-            'prompt_tokens': 0,
-            'completion_tokens': 0,
-            'abstract_len': 0,
-            'original_len': len(content_dict.get('content', '')),
-            'errors': [],
-            'failed_callbacks': []
-        }
-
+    def process_single_content(self, row):
+        result = {'id': row['id'], 'status': 'success', 'cost': 0.0,
+                  'prompt_tokens': 0, 'completion_tokens': 0, 'abstract_len': 0,
+                  'original_len': len(row.get('content') or ''), 'errors': [], 'failed_callbacks': []}
         try:
-            # API调用
-            result_template['original_len'] = len(content_dict.get('content', ''))
-            if not content_dict.get('content'):
-                result_template.update({
-                    'status': 'failed',
-                    'errors': ['empty_content']
-                })
-                logger.warning(f"内容为空 ID:{content_id}")
-                return result_template
-
-            content_len = count_words(content_dict['content'])
-            if content_len < 250:
-                logger.info(f"开始处理内容 ID:{content_id}，原文长度:{content_len}")
-                used_prompt = self.short_content_prompt
+            content = row.get('content')
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError('empty_content')
+            length = count_words(content)
+            if length < 250:
+                prompt = short_content_prompt
+                maximum = 300
             else:
-                min_abstract_len = calculate_abstract_length(content_len)
-                max_abstract_len = min(min_abstract_len * 2, 300)
-                logger.info(f"开始处理内容 ID:{content_id}，原文长度:{content_len}, 预期摘要长度:{min_abstract_len}-{max_abstract_len}")
-                used_prompt = self.base_content_prompt.format(
-                    min_abstract_len=min_abstract_len,
-                    max_abstract_len=max_abstract_len
-                )
-
-            llm_response, usage = _call_doubao_api_stream(
-                used_prompt + str(content_dict['content']),
-                "你是新闻阅读与结构化整理专家", 
-                model_name=DOUBAO_MODEL_NAME
-            )
-            if len(llm_response) == 0:
-                result_template.update({
-                    'status': 'failed',
-                    'errors': ['api_call_failed']
-                })
-                return result_template
-
-            # 记录使用量和成本
-            model_cost = self.model_costs[DOUBAO_MODEL_NAME]
-            cost = (
-                usage.get('prompt_tokens', 0) * model_cost['prompt'] +
-                usage.get('completion_tokens', 0) * model_cost['completion'] +
-                usage.get('prompt_cache_hit_tokens', 0) * model_cost.get('cache_prompt', 0)
-            )
-
-            with self.lock:
-                self.usage_records[content_id] = usage
-                self.total_cost += cost
-
-            result_template.update({
-                'cost': round(cost, 8), 
-                'prompt_tokens': usage.get('prompt_tokens', 0),
-                'completion_tokens': usage.get('completion_tokens', 0)
-            })
-
-            # 解析结果
-            flag, content_ans_dict = parse_json(llm_response)
-            if not flag:
-                result_template.update({
-                    'status': 'failed',
-                    'errors': ['json_parse_failed']
-                })
-                logger.error(f"JSON解析失败 ID:{content_id}")
-                return result_template
-
-            # 记录摘要长度，将title拼接到abstract前面
-            title = content_ans_dict.get('title', '')
-            abstract_body = content_ans_dict.get('abstract', '')
-            abstract = f"{title}\n{abstract_body}" if title else abstract_body
-            result_template['abstract_len'] = len(abstract)
-
-            # 国家二次纠正
-            country_list = content_ans_dict.get('country', [])
-            norm_country_list = []
-            for country in country_list:
+                minimum = calculate_abstract_length(length)
+                maximum = min(minimum * 2, 300)
+                prompt = base_content_prompt.format(min_abstract_len=minimum, max_abstract_len=maximum)
+            text, usage = chat(prompt + content, '你是新闻阅读与结构化整理专家', DOUBAO_CONFIG)
+            cost = estimate_cost(DOUBAO_CONFIG['MODEL_NAME'], usage)
+            total_prompt = usage.get('prompt_tokens', 0)
+            total_completion = usage.get('completion_tokens', 0)
+            answer = validate_summary(text)
+            result.update(cost=round(cost, 8), prompt_tokens=total_prompt,
+                          completion_tokens=total_completion)
+            abstract = answer['title'] + '\n' + answer['abstract']
+            result['abstract_len'] = len(abstract)
+            countries = []
+            for country in answer['country']:
                 country = country.strip().split('(')[0].split('（')[0]
                 country = country_normalization_map.get(country, country)
-                norm_country_list.append(country)
-
-            # 回调任务处理
-            tasks = [
-                ("genAbstract", abstract),
-                ("genKeyword", content_ans_dict.get('keywords', [])),
-                ("recCountry", norm_country_list),
-            ]
-
-            # 判断是否回调embedding
-            if content_id in self.embedding_id_dict:
-                tasks.append(("genVec", self.embedding_id_dict[content_id]))
-                del self.embedding_id_dict[content_id]
-
-            callback_errors = []
-            for taskname, result in tasks:
+                if country and country not in countries:
+                    countries.append(country)
+            # recCountry is the acquisition queue: only acknowledge it after all earlier writes succeed.
+            tasks = [('genAbstract', abstract), ('genKeyword', answer['keywords']), ('recCountry', countries)]
+            cached_vector = pending_vectors.get(row['id'])
+            if cached_vector is not None:
+                tasks.insert(0, ('genVec', cached_vector))
+            for task, value in tasks:
                 try:
-                    requests.post(
-                        f"{NEWS_API_BASE_URL}/recallTask",
-                        json={"taskname": taskname, 
-                              "data": [{"id": content_id, "result": result, "cost": round(cost/len(tasks), 8)}]
-                        },
-                        timeout=10
-                    )
-                except Exception as e:
-                    traceback.print_exc()
-                    error_key = f"callback_{taskname}_failed"
-                    callback_errors.append(error_key)
-                    result_template['failed_callbacks'].append(taskname)
-                    logger.warning(f"回调任务失败 {taskname}-{content_id}")
+                    callback(task, [{'id': row['id'], 'result': value, 'cost': 0.0 if task == 'genVec' else round(cost / 3, 8)}])
+                    if task == 'genVec':
+                        pending_vectors.delete(row['id'])
+                except Exception:
+                    result['failed_callbacks'].append(task)
+                    result['errors'].append('callback_' + task + '_failed')
+                    result['status'] = 'partial_success'
+                    logger.exception('新闻 %s 的 %s 回写失败', row['id'], task)
+                    break
+        except Exception as exc:
+            result['status'] = 'failed'
+            result['errors'].append(str(exc))
+            logger.exception('内容处理失败: %s', row['id'])
+        return result
 
-
-            if callback_errors:
-                result_template.update({
-                    'status': 'partial_success' if result_template['status'] == 'success' else 'failed',
-                    'errors': result_template['errors'] + callback_errors
-                })
-
-            logger.info(
-                f"内容处理成功 ID:{content_id} | 成本:{cost:.04f} | "
-                f"原始长度:{content_len} | "
-                f"摘要长度:{len(abstract)}"
-            )
-            return result_template
-
-        except Exception as e:
-            traceback.print_exc()
-
-            error_type = type(e).__name__
-            trace = traceback.format_exc()
-            with self.lock:
-                self.usage_records[content_id] = {"error": error_type}
-
-            result_template.update({
-                'status': 'failed',
-                'errors': [f'exception_{error_type}'],
-                'error_details': trace
-            })
-            logger.error(f"处理失败 ID:{content_id} | 错误类型:{error_type} | 错误详情:{trace}")
-            return result_template
-
-    def batch_process_contents(self, batch_size=10):
-        """批量处理新闻内容，返回增强的统计信息"""
-        # 跑批单独初始化总成本
-        self.usage_records = {}
-        self.total_cost = 0.0
-
+    def batch_process_contents(self, batch_size=None):
+        started = time.monotonic()
         try:
-            start_time = time.time()
-            content_list = self._get_content_list()
-            if not content_list:
-                return {
-                    'status': 'success',
-                    'message': '无任何文字',
-                    'statistics': {}
-                }
-
-            logger.info(f"开始批量处理 {len(content_list)} 条内容")
-            processing_results = []
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as executor:
-                future_to_content = {
-                    executor.submit(self.process_single_content, content): content
-                    for content in content_list
-                }
-                
-                for future in concurrent.futures.as_completed(future_to_content):
-                    try:
-                        result = future.result(timeout=300)
-                        processing_results.append(result)
-                    except Exception as e:
-                        error_result = {
-                            'id': future_to_content[future].get('id', 'unknown'),
-                            'status': 'failed',
-                            'errors': ['processing_timeout'],
-                            'error_details': str(e),
-                            'cost': 0
-                        }
-                        traceback.print_exc()
-                        processing_results.append(error_result)
-
-            # 生成统计信息
-            stats = {
-                'total': len(processing_results),
-                'success': sum(1 for r in processing_results if r['status'] == 'success'),
-                'partial_success': sum(1 for r in processing_results if r['status'] == 'partial_success'),
-                'failed': sum(1 for r in processing_results if r['status'] == 'failed'),
-                'total_cost': sum(r['cost'] for r in processing_results),
-                # 'total_prompt_tokens': sum(r['prompt_tokens'] for r in processing_results),
-                # 'total_completion_tokens': sum(r['completion_tokens'] for r in processing_results),
-                'avg_processing_time': (time.time() - start_time) / len(processing_results),
-                'common_errors': self._analyze_error_patterns(processing_results),
-                'callback_failure_rates': self._calculate_callback_failure_rates(processing_results)
-            }
-
-            # 生成详细报告
-            logger.info(f"\n{'='*30} 批量处理报告 {'='*30}"
-                    f"\n[总量统计]"
-                    f"\n• 总数: {stats['total']}"
-                    f"\n• 成功: {stats['success']} ({stats['success']/stats['total']:.1%})"
-                    f"\n• 部分成功: {stats['partial_success']} ({stats['partial_success']/stats['total']:.1%})"
-                    f"\n• 失败: {stats['failed']} ({stats['failed']/stats['total']:.1%})"
-                    f"\n• 总成本: {stats['total_cost']:.4f}"
-                    f"\n• 平均处理时间: {stats['avg_processing_time']:.2f}s/item"
-                    f"\n{'='*70}")
-
-            return {
-                'status': 'success',
-                'processed_count': len(processing_results),
-                'statistics': stats,
-                'detailed_results': processing_results  # 返回前50条详情防止过大响应
-            }
-
-        except Exception as e:
-            logger.error(f"批量处理异常: {str(e)}\n{traceback.format_exc()}")
-            traceback.print_exc()
-            return {
-                'status': 'error',
-                'error_type': type(e).__name__,
-                'message': str(e)
-            }
-        
-    # Helper methods
-    def _analyze_error_patterns(self, results):
-        error_counter = Counter()
-        for result in results:
-            error_counter.update(result['errors'])
-        return dict(error_counter)
-
-    def _calculate_callback_failure_rates(self, results):
-        callback_stats = defaultdict(int)
-        total = len(results)
-        for result in results:
-            for task in result.get('failed_callbacks', []):
-                callback_stats[task] += 1
-        return {k: f"{v/total:.1%}" for k, v in callback_stats.items()}
+            rows = self._get_content_list()
+            if not rows:
+                return {'status': 'success', 'message': '无待处理正文', 'processed_count': 0,
+                        'statistics': {'total': 0, 'success': 0, 'partial_success': 0, 'failed': 0, 'total_cost': 0},
+                        'detailed_results': []}
+            with ThreadPoolExecutor(max_workers=batch_size or RUNTIME_CONFIG['CONTENT_WORKERS']) as executor:
+                futures = [executor.submit(self.process_single_content, row) for row in rows]
+                results = [future.result() for future in as_completed(futures)]
+            statuses = Counter(r['status'] for r in results)
+            errors = Counter(e for r in results for e in r['errors'])
+            callback_errors = Counter(t for r in results for t in r['failed_callbacks'])
+            status = 'success' if statuses['success'] == len(results) else ('error' if statuses['failed'] == len(results) else 'partial_success')
+            return {'status': status, 'processed_count': len(results), 'statistics': {
+                'total': len(results), 'success': statuses['success'], 'partial_success': statuses['partial_success'],
+                'failed': statuses['failed'], 'total_cost': sum(r['cost'] for r in results),
+                'avg_processing_time': (time.monotonic() - started) / len(results),
+                'common_errors': dict(errors),
+                'callback_failure_rates': {k: f'{v / len(results):.1%}' for k, v in callback_errors.items()}},
+                'detailed_results': results}
+        except Exception as exc:
+            logger.exception('内容批次失败')
+            return {'status': 'error', 'message': str(exc), 'processed_count': 0}
 
 
-# 初始化处理器
 news_analyzer = NewsAnalyzer()
-# content_processor = ContentProcessor()
 
-# 定时任务配置
-@scheduler.scheduled_job('interval', minutes=10)  # 十分钟一次
-def scheduled_news_analysis():
-    for i in range(3):   # 执行3*20=60条新闻分析
-        news_analyzer.analyze_news_list()
 
-@scheduler.scheduled_job('interval', minutes=10)   # 十分钟一次
-def scheduled_content_processing():
-    for i in range(2):   # 执行2*10=20条新闻摘要、翻译等
-        news_analyzer.batch_process_contents(batch_size=10)
+def run_pipeline():
+    global last_pipeline
+    if not ready or not processing_lock.acquire(blocking=False):
+        logger.info('跳过本轮：尚未就绪或已有任务执行')
+        return
+    try:
+        reports = []
+        for _ in range(RUNTIME_CONFIG['TITLE_ROUNDS']):
+            report = news_analyzer.analyze_news_list()
+            reports.append(report)
+            if report['status'] != 'success' or not report.get('processed_count'):
+                break
+        for _ in range(RUNTIME_CONFIG['CONTENT_ROUNDS']):
+            report = news_analyzer.batch_process_contents()
+            reports.append(report)
+            if report['status'] != 'success' or not report.get('processed_count'):
+                break
+        last_pipeline = {'finished_at': datetime.now(timezone.utc).isoformat(),
+                         'status': 'success' if all(r['status'] == 'success' for r in reports) else 'error',
+                         'reports': reports}
+        logger.info('本轮分类与摘要完成: %s', last_pipeline['status'])
+    finally:
+        processing_lock.release()
 
-# API接口
-@app.route('/trigger/news', methods=['GET'])
+
+def refresh_faiss_matrix():
+    global faiss_matrix
+    if not RUNTIME_CONFIG['DB_ENABLED'] or not processing_lock.acquire(blocking=False):
+        return
+    try:
+        from add_embedding_time import add_missing_embeddings
+        result = add_missing_embeddings(hours=VECTOR_SEARCH_CONFIG['LOAD_HOURS'])
+        if result['fail']:
+            raise RuntimeError('部分历史向量补充失败，保留当前索引')
+        staged = VectorSearch(VECTOR_SEARCH_CONFIG['DIMENSION'], logger)
+        staged.import_from_mysql(VECTOR_SEARCH_CONFIG['LOAD_HOURS'])
+        for ident, vector in pending_vectors.recent(VECTOR_SEARCH_CONFIG['LOAD_HOURS']):
+            staged.add_vector(vector, news_id=ident)
+        faiss_matrix = staged
+    except Exception:
+        logger.exception('向量刷新失败，保留当前索引')
+    finally:
+        processing_lock.release()
+
+
+def initialize_service():
+    global ready, faiss_matrix
+    if ready:
+        return
+    validate_model_config()
+    for key in ('INTERVAL_SECONDS', 'HTTP_TIMEOUT', 'MODEL_TIMEOUT', 'TITLE_BATCH_SIZE', 'CONTENT_BATCH_SIZE',
+                'CONTENT_WORKERS', 'TITLE_ROUNDS', 'CONTENT_ROUNDS'):
+        if RUNTIME_CONFIG[key] <= 0:
+            raise ValueError(key + ' 必须大于零')
+    if RUNTIME_CONFIG['STARTUP_DELAY_SECONDS'] < 0:
+        raise ValueError('启动延迟不可为负数')
+    if RUNTIME_CONFIG['DB_ENABLED']:
+        staged = VectorSearch(VECTOR_SEARCH_CONFIG['DIMENSION'], logger)
+        staged.import_from_mysql(VECTOR_SEARCH_CONFIG['LOAD_HOURS'])
+        faiss_matrix = staged
+    for ident, vector in pending_vectors.recent(VECTOR_SEARCH_CONFIG['LOAD_HOURS']):
+        faiss_matrix.add_vector(vector, news_id=ident)
+    ready = True
+    logger.info('服务初始化完成，历史向量导入=%s，索引条数=%s',
+                RUNTIME_CONFIG['DB_ENABLED'], faiss_matrix.display_embedding_nums())
+
+
+def start_scheduler():
+    if not RUNTIME_CONFIG['SCHEDULER_ENABLED'] or scheduler.running:
+        return
+    if not ready:
+        raise RuntimeError('请先初始化服务')
+    scheduler.add_job(run_pipeline, 'interval', seconds=RUNTIME_CONFIG['INTERVAL_SECONDS'],
+                      next_run_time=datetime.now(timezone.utc) + timedelta(seconds=RUNTIME_CONFIG['STARTUP_DELAY_SECONDS']),
+                      id='news_pipeline', max_instances=1, coalesce=True, misfire_grace_time=60)
+    if RUNTIME_CONFIG['DB_ENABLED']:
+        scheduler.add_job(refresh_faiss_matrix, 'interval', hours=1, id='refresh_vectors',
+                          max_instances=1, coalesce=True)
+    scheduler.start()
+    logger.info('首次任务等待 %s 秒，此后每 %s 秒执行',
+                RUNTIME_CONFIG['STARTUP_DELAY_SECONDS'], RUNTIME_CONFIG['INTERVAL_SECONDS'])
+
+
+def configure_logging():
+    logging.basicConfig(level=logging.INFO, format='[%(levelname)s-%(asctime)s] %(message)s',
+                        handlers=[logging.StreamHandler(), logging.FileHandler(
+                            os.getenv('NEWS_LOG_FILE', 'news_analysis.log'), encoding='utf-8')])
+
+
+@app.get('/healthz')
+def health():
+    job = scheduler.get_job('news_pipeline')
+    return jsonify({'status': 'ready' if ready else 'not_ready', 'scheduler_running': scheduler.running,
+                    'startup_delay_seconds': RUNTIME_CONFIG['STARTUP_DELAY_SECONDS'],
+                    'interval_seconds': RUNTIME_CONFIG['INTERVAL_SECONDS'],
+                    'next_run_time': job.next_run_time.isoformat() if job and scheduler.running else None,
+                    'history_loaded': RUNTIME_CONFIG['DB_ENABLED'] and ready,
+                    'vector_count': faiss_matrix.display_embedding_nums(),
+                    'models': {'classify': LLM_CONFIG['MODEL_NAME'], 'summary': DOUBAO_CONFIG['MODEL_NAME'],
+                               'embedding': EMBEDDING_CONFIG['MODEL_NAME']}, 'last_pipeline': last_pipeline}), 200 if ready else 503
+
+
+def trigger(method):
+    if not ready:
+        return jsonify({'status': 'error', 'message': '服务尚未初始化'}), 503
+    if not processing_lock.acquire(blocking=False):
+        return jsonify({'status': 'busy', 'message': '已有任务执行，请稍后重试'}), 409
+    try:
+        result = method()
+        return jsonify(result), 200 if result['status'] == 'success' else 502
+    finally:
+        processing_lock.release()
+
+
+# Retain existing GET clients; POST is preferred for operations that change task state.
+@app.route('/trigger/news', methods=['GET', 'POST'])
 def trigger_news_analysis():
-    result_flag, cost = news_analyzer.analyze_news_list()
-    return jsonify({
-        "status": "success" if result_flag else "error",
-        "message": "新闻列表分析已启动" if result_flag else "分析启动失败",
-        "cost": round(cost, 8) if result_flag else 0.0
-    })
+    return trigger(news_analyzer.analyze_news_list)
 
-@app.route('/trigger/content', methods=['GET'])
+
+@app.route('/trigger/content', methods=['GET', 'POST'])
 def trigger_content_processing():
-    # result = content_processor.batch_process_contents()
-    result = news_analyzer.batch_process_contents()
-    return jsonify(result)
+    return trigger(news_analyzer.batch_process_contents)
 
-# scheduler.start()
 
 if __name__ == '__main__':
-    scheduler.start()
+    configure_logging()
+    initialize_service()
+    start_scheduler()
     try:
-        app.run(host='0.0.0.0', port=2400, use_reloader=False)
-    except KeyboardInterrupt:
-        scheduler.shutdown()
+        app.run(host=os.getenv('HOST', '127.0.0.1'), port=int(os.getenv('PORT', '2400')), use_reloader=False)
+    finally:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)

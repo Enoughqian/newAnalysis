@@ -3,7 +3,7 @@ import re, json, ast
 def safe_eval(data):
     try:
         if isinstance(data, (str, bytes)):
-            result = eval(data)
+            result = ast.literal_eval(data)
         else:
             result = data
     except TypeError:
@@ -26,20 +26,15 @@ def parse_json(text):
     try:
         # 尝试解析 JSON 字符串
         data_dict = json.loads(json_str)
-        print(f"解析成功: {data_dict}")
         return True, data_dict
     except json.JSONDecodeError as e:
-        print(f"JSON解析错误: {e}")
         if isinstance(json_str, (str, bytes)):
             try:
                 data_dict = ast.literal_eval(json_str)
-                print(f"使用 ast.literal_eval 解析成功: {data_dict}")
                 return True, data_dict
             except (ValueError, SyntaxError) as eval_error:
-                print(f"ast.literal_eval 解析失败: {eval_error}")
                 return False, f"{json_str} || 无法解析"
         else:
-            print(f"返回无法解析：{json_str}")
             return False, f"{json_str} || 无法解析"
 
 # 格式化耗时为可视化字符串

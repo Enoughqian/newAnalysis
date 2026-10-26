@@ -70,3 +70,11 @@ desktop.ini
 # 自定义忽略
 .env.testing
 .env.release
+# 本地测试结果及历史向量备份
+/test-results/
+/embedding-backup*.jsonl
+
+# 本机凭据及发布前备份
+/.local-backup/
+/config.py.legacy
+/server-before-update.patch
