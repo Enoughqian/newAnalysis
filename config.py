@@ -4,12 +4,15 @@ import os
 LLM_CONFIG = {
     'API_KEY': '82455d5f-5d05-4fa3-988d-f5b4c9d173d9',
     "BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
-    'MODEL_NAME': 'doubao-seed-2-0-pro-260215',
+    'MODEL_NAME': 'deepseek-v4-1-flash-economy-261017', #'doubao-seed-2-0-pro-260215',
     'REASONING_EFFORT': 'medium',
     'COSTS': {
-        "doubao-seed-2-0-pro-260215": {"prompt": 0.0032 / 1000, "completion": 0.016 / 1000},
-        "doubao-seed-2-0-lite-260215": {"prompt": 0.0006 / 1000, "completion": 0.0036 / 1000},
-        "doubao-embedding-large-text-240915": {"prompt": 0.0007},
+        "doubao-seed-2-0-pro-260215": {"prompt": 0.0060/ 1000, "completion": 0.030 / 1000},
+        "deepseek-v4-1-flash-economy-261017": {"prompt": 0.0016/ 1000, "completion": 0.0064 / 1000},
+        "deepseek-v4-1-flash-261017": {"prompt": 0.002/ 1000, "completion": 0.008 / 1000},
+        "doubao-seed-2-1-turbo-260628": {"prompt": 0.0030 / 1000, "completion": 0.015 / 1000},
+        "doubao-seed-2-1-lite-260915": {"prompt": 0.0008 / 1000, "completion": 0.0027 / 1000},
+        "doubao-embedding-vision-251215": {"prompt": 0.0007},
     }
 }
 
@@ -17,7 +20,7 @@ LLM_CONFIG = {
 DOUBAO_CONFIG = {
     'API_KEY': '82455d5f-5d05-4fa3-988d-f5b4c9d173d9',
     'BASE_URL': 'https://ark.cn-beijing.volces.com/api/v3',
-    'MODEL_NAME': "doubao-seed-2-0-lite-260215",
+    'MODEL_NAME': "doubao-seed-2-1-lite-260915",
     'REASONING_EFFORT': 'low',
 }
 
@@ -25,7 +28,7 @@ DOUBAO_CONFIG = {
 EMBEDDING_CONFIG = {
     'API_KEY': '82455d5f-5d05-4fa3-988d-f5b4c9d173d9',
     'BASE_URL': 'https://ark.cn-beijing.volces.com/api/v3',
-    'MODEL_NAME': "doubao-embedding-large-text-240915", 
+    'MODEL_NAME': "doubao-embedding-vision-251215", 
 }
 
 # 新闻服务API配置
