@@ -6,3 +6,4 @@ mysql-connector-python
 faiss-cpu
 gunicorn
 scikit-learn
+python-dotenv

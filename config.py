@@ -1,8 +1,13 @@
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / '.env')
 
 # LLM配置
 LLM_CONFIG = {
-    'API_KEY': '82455d5f-5d05-4fa3-988d-f5b4c9d173d9',
+    'API_KEY': os.environ['ARK_API_KEY'],
     "BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
     'MODEL_NAME': 'deepseek-v4-1-flash-economy-261017', #'doubao-seed-2-0-pro-260215',
     'REASONING_EFFORT': 'medium',
@@ -18,7 +23,7 @@ LLM_CONFIG = {
 
 # DOUBAO LLM配置（翻译与摘要）
 DOUBAO_CONFIG = {
-    'API_KEY': '82455d5f-5d05-4fa3-988d-f5b4c9d173d9',
+    'API_KEY': os.environ['ARK_API_KEY'],
     'BASE_URL': 'https://ark.cn-beijing.volces.com/api/v3',
     'MODEL_NAME': "doubao-seed-2-1-lite-260915",
     'REASONING_EFFORT': 'low',
@@ -26,7 +31,7 @@ DOUBAO_CONFIG = {
 
 # Embedding配置
 EMBEDDING_CONFIG = {
-    'API_KEY': '82455d5f-5d05-4fa3-988d-f5b4c9d173d9',
+    'API_KEY': os.environ['ARK_API_KEY'],
     'BASE_URL': 'https://ark.cn-beijing.volces.com/api/v3',
     'MODEL_NAME': "doubao-embedding-vision-251215", 
 }
@@ -39,10 +44,10 @@ NEWS_API_CONFIG = {
 
 # 数据库配置
 DB_CONFIG = {
-    'host': '43.160.200.78',
-    'user': 'work',
-    'password': 'Sqe3u8N_VP',
-    'database': 'spider_news'
+    'host': os.environ['DB_HOST'],
+    'user': os.environ['DB_USER'],
+    'password': os.environ['DB_PASSWORD'],
+    'database': os.environ['DB_NAME'],
 }
 
 # 向量搜索配置
